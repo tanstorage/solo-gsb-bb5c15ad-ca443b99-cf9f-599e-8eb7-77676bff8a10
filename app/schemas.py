@@ -44,3 +44,12 @@ class LeaderboardEntry(BaseModel):
 class LeaderboardOut(BaseModel):
     revision: int
     entries: List[LeaderboardEntry]
+
+
+class LeaderboardPageOut(BaseModel):
+    revision: int
+    entries: List[LeaderboardEntry]
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Signed cursor for the next page; null on the last page.",
+    )

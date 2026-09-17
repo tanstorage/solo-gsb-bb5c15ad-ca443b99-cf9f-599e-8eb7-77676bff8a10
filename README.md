@@ -83,6 +83,42 @@ curl 'localhost:8000/leaderboard?revision=3'   # 指定历史 revision
 
 查询不存在的 revision（`< 1` 或大于当前最大 revision）返回 `404`。
 
+### 排行榜分页 `GET /leaderboard/page`
+
+面向大榜单的游标分页：游标自包含、无服务器端状态，可并发续读。首次请求固定快照 revision，之后携带 `next_cursor` 续读——即使期间持续有新写入，所有页仍读取游标绑定的同一 revision，不会重复或遗漏。
+
+| 查询参数 | 说明 |
+|---|---|
+| `revision` | 可选。首次请求固定快照（默认当前 revision）；携带 `cursor` 时若显式给出，必须与游标绑定的 revision 一致，否则 `422` |
+| `limit` | 每页条数，`1`–`500`，默认 `50` |
+| `cursor` | 上一页响应的 `next_cursor` |
+
+```bash
+curl 'localhost:8000/leaderboard/page?limit=2'
+curl 'localhost:8000/leaderboard/page?limit=2&cursor=<next_cursor>'
+```
+
+```json
+{
+  "revision": 3,
+  "entries": [
+    {
+      "rank": 1,
+      "participant_id": "alice",
+      "total_points": 15,
+      "effective_events": [
+        {"event_id": "e3", "points": 15, "revision": 3, "correction_of": "e2"}
+      ]
+    }
+  ],
+  "next_cursor": "eyJ2IjoxLCJyZXYiOjMsInB0cyI6MTUsInBpZCI6ImFsaWNlIn0.<签名>"
+}
+```
+
+- 排序与 `/leaderboard` 一致（总分降序、`participant_id` 升序），`rank` 跨页连续。
+- 末页 `next_cursor` 为 `null`；空榜正常返回 `{"revision": 0, "entries": [], "next_cursor": null}`。
+- 游标格式为 `base64url(payload).base64url(HMAC-SHA256)`，payload 含版本号、revision、末条总分与 `participant_id`；篡改、格式错误、版本不支持或与显式 `revision` 冲突均返回 `422`，未知 revision 返回 `404`。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
@@ -90,6 +126,15 @@ curl 'localhost:8000/leaderboard?revision=3'   # 指定历史 revision
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/events` | 全部事件（按 revision 升序） |
 | `GET` | `/events/{event_id}` | 单个事件 |
+
+## 配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `LEDGER_DB_PATH` | `/data/ledger.db` | SQLite 数据库文件路径 |
+| `LEADERBOARD_CURSOR_SECRET` | 内置开发默认值 | `/leaderboard/page` 游标的 HMAC-SHA256 签名密钥。**生产环境务必覆盖为强随机值**（如 `openssl rand -hex 32`）；更换密钥后旧游标全部失效（续读返回 `422`）。 |
+
+`docker-compose.yml` 中通过 `LEADERBOARD_CURSOR_SECRET: ${LEADERBOARD_CURSOR_SECRET:-dev-only-insecure-cursor-secret}` 注入，可在 shell 环境或 `.env` 文件中覆盖；不配置时 `docker compose up --build` 仍可单命令启动。
 
 ## 本地开发（不用 Docker）
 
@@ -106,7 +151,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序，以及 50 路并发写入下 revision 唯一且连续。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，以及 `/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜）。
 
 ## 设计要点
 
@@ -114,3 +159,4 @@ pytest -v
 - **幂等**：请求载荷序列化为规范化 JSON（键排序）随事件存储；重放时比对，一致返回原结果，不一致返回 409。
 - **生效判定**：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正事件 `c.correction_of = e.event_id`。
 - **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入，配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
+- **游标分页**：`/leaderboard/page` 的游标经 HMAC-SHA256 签名（密钥来自 `LEADERBOARD_CURSOR_SECRET`），绑定 revision 与末条排序键 `(total_points, participant_id)`；续读始终落在游标指定的 revision 上，配合 WAL 快照读，写入并发进行也不会造成分页漂移。
