@@ -7,7 +7,7 @@ from fastapi import FastAPI, Query, Response, status
 
 from . import ledger
 from .db import init_db
-from .schemas import EventIn, EventOut, LeaderboardOut
+from .schemas import EventIn, EventOut, LeaderboardOut, LeaderboardPageOut
 
 
 @asynccontextmanager
@@ -66,3 +66,30 @@ def get_leaderboard(
     )
 ) -> LeaderboardOut:
     return ledger.leaderboard(revision)
+
+
+@app.get(
+    "/leaderboard/page",
+    response_model=LeaderboardPageOut,
+    responses={
+        404: {"description": "Unknown revision"},
+        422: {
+            "description": "Invalid limit, or cursor malformed, tampered, "
+            "or conflicting with the explicit revision"
+        },
+    },
+)
+def get_leaderboard_page(
+    limit: int = Query(default=50, ge=1, le=500, description="Page size."),
+    revision: Optional[int] = Query(
+        default=None,
+        description="Snapshot revision for the first page; defaults to the latest. "
+        "When a cursor is supplied it must match the cursor's revision.",
+    ),
+    cursor: Optional[str] = Query(
+        default=None,
+        description="Signed cursor from a previous page's next_cursor; "
+        "pins the read to the cursor's revision.",
+    ),
+) -> LeaderboardPageOut:
+    return ledger.leaderboard_page(limit=limit, revision=revision, cursor=cursor)

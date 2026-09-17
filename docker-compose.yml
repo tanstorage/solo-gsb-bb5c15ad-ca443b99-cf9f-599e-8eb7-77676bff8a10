@@ -5,6 +5,10 @@ services:
       - "8000:8000"
     environment:
       LEDGER_DB_PATH: /data/ledger.db
+      # HMAC key for signing /leaderboard/page cursors. Override via the
+      # shell environment in real deployments: changing it invalidates all
+      # previously issued cursors (they start returning 422).
+      LEADERBOARD_CURSOR_SECRET: ${LEADERBOARD_CURSOR_SECRET:-dev-only-change-me}
     volumes:
       - ledger-data:/data
     restart: unless-stopped

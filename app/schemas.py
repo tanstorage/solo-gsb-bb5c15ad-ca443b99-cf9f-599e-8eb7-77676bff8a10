@@ -44,3 +44,9 @@ class LeaderboardEntry(BaseModel):
 class LeaderboardOut(BaseModel):
     revision: int
     entries: List[LeaderboardEntry]
+
+
+class LeaderboardPageOut(BaseModel):
+    revision: int
+    entries: List[LeaderboardEntry]
+    next_cursor: Optional[str]

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from bisect import bisect_right
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from fastapi import HTTPException
 
+from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
     EffectiveEvent,
@@ -16,6 +18,7 @@ from .schemas import (
     EventOut,
     LeaderboardEntry,
     LeaderboardOut,
+    LeaderboardPageOut,
 )
 
 
@@ -119,6 +122,49 @@ def current_revision() -> int:
         return conn.execute("SELECT COALESCE(MAX(revision), 0) FROM events").fetchone()[0]
 
 
+def _effective_entries(conn: sqlite3.Connection, revision: int) -> list[LeaderboardEntry]:
+    """Ranked entries (total desc, participant_id asc) as of ``revision``."""
+    rows = conn.execute(
+        """
+        SELECT e.event_id, e.participant_id, e.points, e.revision, e.correction_of
+        FROM events e
+        WHERE e.revision <= ?
+          AND NOT EXISTS (
+                SELECT 1 FROM events c
+                WHERE c.correction_of = e.event_id
+                  AND c.revision <= ?
+          )
+        ORDER BY e.participant_id ASC, e.revision ASC
+        """,
+        (revision, revision),
+    ).fetchall()
+
+    totals: dict[str, int] = {}
+    details: dict[str, list[EffectiveEvent]] = {}
+    for r in rows:
+        pid = r["participant_id"]
+        totals[pid] = totals.get(pid, 0) + r["points"]
+        details.setdefault(pid, []).append(
+            EffectiveEvent(
+                event_id=r["event_id"],
+                points=r["points"],
+                revision=r["revision"],
+                correction_of=r["correction_of"],
+            )
+        )
+
+    ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [
+        LeaderboardEntry(
+            rank=i + 1,
+            participant_id=pid,
+            total_points=total,
+            effective_events=details[pid],
+        )
+        for i, (pid, total) in enumerate(ordered)
+    ]
+
+
 def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
     """Leaderboard as of ``revision`` (default: latest).
 
@@ -138,43 +184,60 @@ def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
                 status_code=404, detail=f"revision {revision} not found"
             )
 
-        rows = conn.execute(
-            """
-            SELECT e.event_id, e.participant_id, e.points, e.revision, e.correction_of
-            FROM events e
-            WHERE e.revision <= ?
-              AND NOT EXISTS (
-                    SELECT 1 FROM events c
-                    WHERE c.correction_of = e.event_id
-                      AND c.revision <= ?
-              )
-            ORDER BY e.participant_id ASC, e.revision ASC
-            """,
-            (revision, revision),
-        ).fetchall()
-
-    totals: dict[str, int] = {}
-    details: dict[str, list[EffectiveEvent]] = {}
-    for r in rows:
-        pid = r["participant_id"]
-        totals[pid] = totals.get(pid, 0) + r["points"]
-        details.setdefault(pid, []).append(
-            EffectiveEvent(
-                event_id=r["event_id"],
-                points=r["points"],
-                revision=r["revision"],
-                correction_of=r["correction_of"],
-            )
-        )
-
-    ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
-    entries = [
-        LeaderboardEntry(
-            rank=i + 1,
-            participant_id=pid,
-            total_points=total,
-            effective_events=details[pid],
-        )
-        for i, (pid, total) in enumerate(ordered)
-    ]
+        entries = _effective_entries(conn, revision)
     return LeaderboardOut(revision=revision, entries=entries)
+
+
+def leaderboard_page(
+    limit: int,
+    revision: Optional[int] = None,
+    cursor: Optional[str] = None,
+) -> LeaderboardPageOut:
+    """One page of the leaderboard, seekable via a signed cursor.
+
+    Without ``cursor`` the snapshot is pinned to ``revision`` (default:
+    latest). With ``cursor`` the cursor's own revision always wins; an
+    explicit ``revision`` that disagrees with it is a 422.
+    """
+    payload = None
+    if cursor is not None:
+        payload = decode_cursor(cursor)  # raises 422 on tampering/format errors
+        if revision is not None and revision != payload.revision:
+            raise HTTPException(
+                status_code=422,
+                detail="explicit revision conflicts with cursor revision",
+            )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+
+        if payload is not None:
+            pinned = payload.revision
+            if pinned > max_rev:
+                raise HTTPException(
+                    status_code=404, detail=f"revision {pinned} not found"
+                )
+        elif revision is not None:
+            if revision < 1 or revision > max_rev:
+                raise HTTPException(
+                    status_code=404, detail=f"revision {revision} not found"
+                )
+            pinned = revision
+        else:
+            pinned = max_rev  # 0 on an empty ledger -> empty page
+
+        entries = _effective_entries(conn, pinned)
+
+    start = 0
+    if payload is not None:
+        keys = [(-e.total_points, e.participant_id) for e in entries]
+        start = bisect_right(keys, (-payload.total_points, payload.participant_id))
+
+    page = entries[start : start + limit]
+    next_cursor = None
+    if start + limit < len(entries):
+        last = page[-1]
+        next_cursor = encode_cursor(pinned, last.total_points, last.participant_id)
+    return LeaderboardPageOut(revision=pinned, entries=page, next_cursor=next_cursor)
